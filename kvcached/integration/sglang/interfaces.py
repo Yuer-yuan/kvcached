@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -156,6 +157,39 @@ def alloc_kv_cache(
     # automatically 2*PAGE_SIZE-aligned.
     alignment = 2 * PAGE_SIZE if is_mla else PAGE_SIZE
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // alignment) * alignment
+
+    # The upstream SGLang adapter reserves a virtual FTensor spanning the full
+    # device even when the engine's logical token pool is much smaller.  CUDA
+    # VMM address reservation is cheap on discrete GPUs, but Jetson's NvMap
+    # must install the shared zero-page mapping at every virtual compound page;
+    # a device-sized range therefore consumes substantial UMA bookkeeping and
+    # can prevent even the first real KV page from being admitted.  Keep the
+    # original behavior by default and expose an explicit UMA-safe mode that
+    # bounds the virtual range to the requested logical capacity.
+    if os.getenv("KVCACHED_BOUND_VIRTUAL_CAPACITY", "false").lower() in (
+        "true",
+        "1",
+    ):
+        requested_bytes_per_layer_k_or_v = (
+            requested_num_tokens
+            * math.prod(kvcache_shape[1:])
+            * dtype.itemsize
+        )
+        requested_bytes_per_layer_k_or_v = (
+            (requested_bytes_per_layer_k_or_v + alignment - 1) // alignment
+        ) * alignment
+        device_limit_bytes_per_layer_k_or_v = gpu_mem_bytes_per_layer_k_or_v
+        gpu_mem_bytes_per_layer_k_or_v = min(
+            requested_bytes_per_layer_k_or_v,
+            device_limit_bytes_per_layer_k_or_v,
+        )
+        logger.info(
+            "Bound SGLang virtual KV range to requested capacity: "
+            "%d tokens, %.2f MiB per layer across %d KV buffer(s)",
+            requested_num_tokens,
+            gpu_mem_bytes_per_layer_k_or_v * num_k_or_v / (1024**2),
+            num_k_or_v,
+        )
 
     raw_kv_tensors = create_kv_tensors(
         gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers,

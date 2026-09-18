@@ -19,9 +19,34 @@ GPU: it stubs ``torch.cuda.get_device_properties`` and intercepts the ``size``
 argument passed to ``create_kv_tensors`` (== ftensor_bytes_per_layer).
 """
 import importlib
+import sys
+import types
 
 import pytest
 import torch
+
+
+def _install_fake_vmm_ops_if_needed():
+    """Allow this arithmetic-only regression test to run without a GPU build."""
+    try:
+        import kvcached.vmm_ops  # noqa: F401
+        return
+    except Exception:  # noqa: BLE001 - any load failure means no usable extension
+        pass
+
+    fake = types.ModuleType("kvcached.vmm_ops")
+    fake.PageAllocator = type("FakePageAllocator", (), {})
+    fake.InternalPage = type("FakeInternalPage", (), {})
+    fake.kv_tensors_created = lambda *args, **kwargs: True
+    fake.map_to_kv_tensors = lambda *args, **kwargs: None
+    fake.unmap_from_kv_tensors = lambda *args, **kwargs: None
+    fake.create_kv_tensors = lambda *args, **kwargs: None
+    fake.init_kvcached = lambda *args, **kwargs: None
+    fake.shutdown_kvcached = lambda *args, **kwargs: None
+    sys.modules["kvcached.vmm_ops"] = fake
+
+
+_install_fake_vmm_ops_if_needed()
 
 from kvcached.utils import PAGE_SIZE
 
@@ -78,6 +103,7 @@ def test_ftensor_bytes_aligned_to_2x_page_size(monkeypatch, integration,
     gpu_mem_bytes = gpu_gb * (1024 ** 3)
 
     monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_properties",
                         lambda dev=None: _FakeProps(gpu_mem_bytes))
 
@@ -112,3 +138,36 @@ def test_sweep_includes_pre_fix_failure_witness():
         "No config exercises the pre-fix failure mode; the alignment test would "
         "pass even without the fix. Add a (gpu_gb, num_layers) that yields an odd "
         "multiple of PAGE_SIZE for MLA.")
+
+
+def test_sglang_bounded_virtual_capacity_uses_requested_tokens(monkeypatch):
+    """UMA mode must not reserve an otherwise unused device-sized FTensor."""
+    mod = importlib.import_module("kvcached.integration.sglang.interfaces")
+    gpu_mem_bytes = 8 * (1024 ** 3)
+    monkeypatch.setenv("KVCACHED_BOUND_VIRTUAL_CAPACITY", "true")
+    monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda dev=None: _FakeProps(gpu_mem_bytes),
+    )
+
+    def _fake_create_kv_tensors(size, *args, **kwargs):
+        raise _CapturedSize(size)
+
+    monkeypatch.setattr(mod, "create_kv_tensors", _fake_create_kv_tensors)
+
+    # 1024 tokens * 8 heads * 128 dimensions * FP16 = exactly one 2 MiB
+    # VMM page per K or V buffer, hence 4 MiB combined per-layer FTensor.
+    with pytest.raises(_CapturedSize) as excinfo:
+        mod.alloc_kv_cache(
+            (1024, 8, 128),
+            DTYPE,
+            "cuda:0",
+            num_layers=24,
+            page_size=BLOCK_SIZE,
+            attention_type="MHA",
+        )
+
+    assert excinfo.value.size == 2 * PAGE_SIZE

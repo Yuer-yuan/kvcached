@@ -11,6 +11,7 @@ import pytest
 from kvcached.integration.sglang.patches import (
     ElasticAllocatorPatch,
     ElasticSWAAllocatorPatch,
+    _get_sglang_parallel_coordinates,
 )
 
 
@@ -35,6 +36,26 @@ class FakeKVCachedAllocator:
 class FakeKVCache:
     def __init__(self):
         self.kvcached_allocator = FakeKVCachedAllocator()
+
+
+def test_parallel_coordinates_use_tp_and_pp_groups(monkeypatch):
+    """PP ranks must not be folded into kvcached's TP-local IPC world."""
+    sglang: Any = types.ModuleType("sglang")
+    srt: Any = types.ModuleType("sglang.srt")
+    distributed: Any = types.ModuleType("sglang.srt.distributed")
+    distributed.get_tp_group = lambda: types.SimpleNamespace(
+        rank_in_group=1, world_size=2
+    )
+    distributed.get_pp_group = lambda: types.SimpleNamespace(
+        rank_in_group=3, world_size=4
+    )
+    sglang.srt = srt
+    srt.distributed = distributed
+    monkeypatch.setitem(sys.modules, "sglang", sglang)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt)
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed)
+
+    assert _get_sglang_parallel_coordinates() == (1, 2, 3)
 
 
 class FakeBaseTokenToKVPoolAllocator:

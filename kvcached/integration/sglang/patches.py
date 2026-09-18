@@ -29,6 +29,62 @@ def _is_supported_gpu_device(device: str) -> bool:
     return device_str.startswith("cuda") or device_str.startswith("hip")
 
 
+def _get_sglang_parallel_coordinates() -> Tuple[int, int, int]:
+    """Return ``(tp_rank, tp_size, pp_rank)`` from SGLang model groups.
+
+    The torch distributed world is TP * PP, whereas kvcached's ``world_size``
+    denotes the TP width within one pipeline stage.  Falling back to the global
+    world therefore makes a PP-only deployment wait for nonexistent local TP
+    workers.  Prefer the group objects, whose API is present in SGLang 0.4.9+
+    and also exposes the PP rank missing from that release's convenience
+    functions.
+    """
+    try:
+        from sglang.srt.distributed import get_pp_group, get_tp_group
+
+        tp_group = get_tp_group()
+        pp_group = get_pp_group()
+        return (
+            int(tp_group.rank_in_group),
+            int(tp_group.world_size),
+            int(pp_group.rank_in_group),
+        )
+    except (ImportError, AttributeError, AssertionError):
+        # Compatibility path for releases that expose rank helpers instead of
+        # the GroupCoordinator accessors.
+        try:
+            from sglang.srt.distributed import (
+                get_pipeline_model_parallel_rank,
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            return (
+                int(get_tensor_model_parallel_rank()),
+                int(get_tensor_model_parallel_world_size()),
+                int(get_pipeline_model_parallel_rank()),
+            )
+        except (ImportError, AttributeError, AssertionError):
+            pass
+
+    # A single-process engine has the unambiguous TP=PP=1 topology.  For a
+    # distributed engine, silently using torch.distributed's global rank/size
+    # would conflate PP with TP and can deadlock the page mapper.
+    try:
+        import torch.distributed as dist
+
+        if dist.is_initialized() and int(dist.get_world_size()) > 1:
+            raise RuntimeError(
+                "Unable to resolve SGLang TP/PP groups for distributed "
+                "kvcached initialization; refusing to use the global world "
+                "as a TP group"
+            )
+    except ImportError:
+        pass
+
+    return 0, 1, 0
+
+
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
     """Return one capacity shared by every rank in the SGLang world group."""
     from sglang.srt.distributed.parallel_state import get_world_group
@@ -57,7 +113,62 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
     def apply(self, model_runner_mod: types.ModuleType) -> bool:
         if not self.initialize_version_info():
             return False
-        return self.patch_profile_available_bytes(model_runner_mod)
+        if not self.applicable_methods:
+            self.logger.warning(
+                "No virtual KV capacity patch matches SGLang %s",
+                self.detected_version,
+            )
+            return False
+        return all(method(model_runner_mod) for method in self.applicable_methods)
+
+    @version_range(">=0.4.9,<0.5.11")
+    def patch_profile_max_num_token(self, model_runner_mod: types.ModuleType) -> bool:
+        """Use an explicit logical token capacity on pre-0.5.11 SGLang.
+
+        These releases derive capacity from device-global free memory after
+        loading weights.  A peer model therefore makes the result negative
+        even though kvcached does not physically allocate the configured KV
+        capacity at startup.  When the operator supplied ``max_total_tokens``,
+        treat it as the virtual capacity and leave physical admission to the
+        elastic page allocator.
+        """
+        ModelRunner = self._get_target_class(model_runner_mod)
+        if ModelRunner is None:
+            return False
+
+        original_profile = getattr(ModelRunner, "profile_max_num_token", None)
+        if original_profile is None:
+            self.logger.warning(
+                "SGLang ModelRunner does not expose profile_max_num_token"
+            )
+            return False
+        if self._is_already_patched(original_profile, "virtual_kv_capacity"):
+            return True
+
+        @functools.wraps(original_profile)
+        def _patched_profile_max_num_token(runner, total_gpu_memory: int) -> int:
+            if not enable_kvcached() or not _is_supported_gpu_device(runner.device):
+                return original_profile(runner, total_gpu_memory)
+
+            configured_tokens = getattr(
+                runner.server_args, "max_total_tokens", None
+            )
+            if configured_tokens is None or int(configured_tokens) <= 0:
+                return original_profile(runner, total_gpu_memory)
+
+            logger.info(
+                "Using explicit kvcached virtual KV capacity for SGLang %s: "
+                "max_total_tokens=%d; physical pages remain demand allocated",
+                self.detected_version,
+                int(configured_tokens),
+            )
+            return int(configured_tokens)
+
+        self._mark_as_patched(
+            _patched_profile_max_num_token, "virtual_kv_capacity"
+        )
+        ModelRunner.profile_max_num_token = _patched_profile_max_num_token
+        return True
 
     @version_range(">=0.5.11")
     def patch_profile_available_bytes(self, model_runner_mod: types.ModuleType) -> bool:
@@ -160,15 +271,25 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
         if success:
             success &= self.alias_allocator_to_elastic(alloc_mod)
 
-        # Also inject and alias the paged variant for page_size > 1
-        paged_success = self.inject_elastic_paged_allocator(alloc_mod)
-        if paged_success:
-            paged_success &= self.alias_paged_allocator_to_elastic(alloc_mod)
-        success &= paged_success
+        # SGLang 0.4.9 only exposes the token allocator (page_size=1).  Do
+        # not turn a working token-allocator patch into a global failure just
+        # because that release has no paged allocator API to replace.
+        has_paged_allocator = hasattr(alloc_mod, "PagedTokenToKVPoolAllocator")
+        if has_paged_allocator:
+            paged_success = self.inject_elastic_paged_allocator(alloc_mod)
+            if paged_success:
+                paged_success &= self.alias_paged_allocator_to_elastic(alloc_mod)
+            success &= paged_success
+        else:
+            logger.info(
+                "SGLang has no PagedTokenToKVPoolAllocator; patched "
+                "TokenToKVPoolAllocator only"
+            )
 
         if success:
             logger.info(
-                "Elastic allocators patched (TokenToKVPool + PagedTokenToKVPool)"
+                "Elastic allocator patch applied (%s)",
+                "token + paged" if has_paged_allocator else "token only",
             )
 
         return success
@@ -282,7 +403,18 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                 inspect.signature(alloc_extend_kernel_fn).parameters
             )
 
-            from sglang.srt.utils import get_num_new_pages, next_power_of_2
+            from sglang.srt.utils import next_power_of_2
+
+            try:
+                from sglang.srt.utils import get_num_new_pages
+            except ImportError:
+                # SGLang 0.4.9 has paged allocators, but computes the number
+                # of new pages inside its Triton kernels instead of exposing
+                # the later helper.  kvcached must know that count before the
+                # kernel launch so it can map the physical compound pages.
+                get_num_new_pages = None
+
+            legacy_paged_api = get_num_new_pages is None
 
             class ElasticPagedTokenToKVPoolAllocator(
                 BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
@@ -303,6 +435,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
                     self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    self.legacy_ret_values = torch.empty(
+                        (), dtype=torch.int64, device=self.device
+                    )
                     logger.info(
                         f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
                         f"page_size={page_size}"
@@ -326,23 +461,74 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     ).reshape(-1)
                     return out_indices
 
-                def alloc_extend(
-                    self,
-                    prefix_lens: torch.Tensor,
-                    prefix_lens_cpu: torch.Tensor,
-                    seq_lens: torch.Tensor,
-                    seq_lens_cpu: torch.Tensor,
-                    last_loc: torch.Tensor,
-                    extend_num_tokens: int,
-                    num_new_pages: Optional[int] = None,
-                ):
+                def alloc_extend(self, prefix_lens: torch.Tensor, *args, **kwargs):
+                    if legacy_paged_api:
+                        if args:
+                            if len(args) != 3:
+                                raise TypeError(
+                                    "SGLang 0.4.9 alloc_extend expects "
+                                    "(prefix_lens, seq_lens, last_loc, "
+                                    "extend_num_tokens)"
+                                )
+                            seq_lens, last_loc, extend_num_tokens = args
+                        else:
+                            seq_lens = kwargs.pop("seq_lens")
+                            last_loc = kwargs.pop("last_loc")
+                            extend_num_tokens = kwargs.pop("extend_num_tokens")
+                        if kwargs:
+                            raise TypeError(
+                                f"Unexpected alloc_extend arguments: {tuple(kwargs)}"
+                            )
+                        prefix_lens_cpu = prefix_lens
+                        seq_lens_cpu = seq_lens
+                        num_new_pages = int(
+                            (
+                                (seq_lens + self.page_size - 1)
+                                // self.page_size
+                                - (prefix_lens + self.page_size - 1)
+                                // self.page_size
+                            )
+                            .sum()
+                            .item()
+                        )
+                    else:
+                        if args:
+                            if len(args) not in (5, 6):
+                                raise TypeError(
+                                    "Paged alloc_extend expects five or six "
+                                    "arguments after prefix_lens"
+                                )
+                            (
+                                prefix_lens_cpu,
+                                seq_lens,
+                                seq_lens_cpu,
+                                last_loc,
+                                extend_num_tokens,
+                            ) = args[:5]
+                            num_new_pages = (
+                                args[5]
+                                if len(args) == 6
+                                else kwargs.pop("num_new_pages", None)
+                            )
+                        else:
+                            prefix_lens_cpu = kwargs.pop("prefix_lens_cpu")
+                            seq_lens = kwargs.pop("seq_lens")
+                            seq_lens_cpu = kwargs.pop("seq_lens_cpu")
+                            last_loc = kwargs.pop("last_loc")
+                            extend_num_tokens = kwargs.pop("extend_num_tokens")
+                            num_new_pages = kwargs.pop("num_new_pages", None)
+                        if kwargs:
+                            raise TypeError(
+                                f"Unexpected alloc_extend arguments: {tuple(kwargs)}"
+                            )
+
                     self.seen_max_num_extend_tokens_next_power_of_2 = max(
                         self.seen_max_num_extend_tokens_next_power_of_2,
                         next_power_of_2(extend_num_tokens),
                     )
                     bs = len(prefix_lens)
 
-                    if num_new_pages is None:
+                    if num_new_pages is None and get_num_new_pages is not None:
                         num_new_pages = get_num_new_pages(
                             seq_lens=seq_lens_cpu,
                             page_size=self.page_size,
@@ -362,40 +548,87 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     out_indices = torch.empty(
                         (extend_num_tokens,), dtype=torch.int64, device=self.device
                     )
-                    kernel_kwargs: dict[str, Any] = {
-                        "pre_lens_ptr": prefix_lens,
-                        "seq_lens_ptr": seq_lens,
-                        "last_loc_ptr": last_loc,
-                        "free_page_ptr": free_pages,
-                        "out_indices": out_indices,
-                        "bs_upper": next_power_of_2(bs),
-                        "page_size": self.page_size,
-                    }
-                    if "ret_values" in alloc_extend_param_names:
-                        kernel_kwargs["ret_values"] = torch.empty(
-                            (), dtype=torch.int64, device=self.device
+                    if legacy_paged_api:
+                        alloc_extend_kernel[(bs,)](
+                            prefix_lens,
+                            seq_lens,
+                            last_loc,
+                            free_pages,
+                            out_indices,
+                            self.legacy_ret_values,
+                            next_power_of_2(bs),
+                            self.page_size,
+                            self.seen_max_num_extend_tokens_next_power_of_2,
                         )
-                    if "max_num_extend_tokens" in alloc_extend_param_names:
-                        kernel_kwargs["max_num_extend_tokens"] = (
-                            self.seen_max_num_extend_tokens_next_power_of_2
-                        )
+                    else:
+                        kernel_kwargs: dict[str, Any] = {
+                            "pre_lens_ptr": prefix_lens,
+                            "seq_lens_ptr": seq_lens,
+                            "last_loc_ptr": last_loc,
+                            "free_page_ptr": free_pages,
+                            "out_indices": out_indices,
+                            "bs_upper": next_power_of_2(bs),
+                            "page_size": self.page_size,
+                        }
+                        if "ret_values" in alloc_extend_param_names:
+                            kernel_kwargs["ret_values"] = self.legacy_ret_values
+                        if "max_num_extend_tokens" in alloc_extend_param_names:
+                            kernel_kwargs["max_num_extend_tokens"] = (
+                                self.seen_max_num_extend_tokens_next_power_of_2
+                            )
 
-                    alloc_extend_kernel[(bs,)](**kernel_kwargs)
+                        alloc_extend_kernel[(bs,)](**kernel_kwargs)
                     return out_indices
 
-                def alloc_decode(
-                    self,
-                    seq_lens: torch.Tensor,
-                    seq_lens_cpu: torch.Tensor,
-                    last_loc: torch.Tensor,
-                ):
-                    bs = len(seq_lens)
+                def alloc_decode(self, seq_lens: torch.Tensor, *args, **kwargs):
+                    if legacy_paged_api:
+                        if args:
+                            if len(args) != 1:
+                                raise TypeError(
+                                    "SGLang 0.4.9 alloc_decode expects "
+                                    "(seq_lens, last_loc)"
+                                )
+                            (last_loc,) = args
+                        else:
+                            last_loc = kwargs.pop("last_loc")
+                        if kwargs:
+                            raise TypeError(
+                                f"Unexpected alloc_decode arguments: {tuple(kwargs)}"
+                            )
+                        seq_lens_cpu = seq_lens
+                        previous_lens = seq_lens - 1
+                        num_new_pages = int(
+                            (
+                                (seq_lens + self.page_size - 1)
+                                // self.page_size
+                                - (previous_lens + self.page_size - 1)
+                                // self.page_size
+                            )
+                            .sum()
+                            .item()
+                        )
+                    else:
+                        if args:
+                            if len(args) != 2:
+                                raise TypeError(
+                                    "Paged alloc_decode expects "
+                                    "(seq_lens, seq_lens_cpu, last_loc)"
+                                )
+                            seq_lens_cpu, last_loc = args
+                        else:
+                            seq_lens_cpu = kwargs.pop("seq_lens_cpu")
+                            last_loc = kwargs.pop("last_loc")
+                        if kwargs:
+                            raise TypeError(
+                                f"Unexpected alloc_decode arguments: {tuple(kwargs)}"
+                            )
+                        num_new_pages = get_num_new_pages(
+                            seq_lens=seq_lens_cpu,
+                            page_size=self.page_size,
+                            decode=True,
+                        )
 
-                    num_new_pages = get_num_new_pages(
-                        seq_lens=seq_lens_cpu,
-                        page_size=self.page_size,
-                        decode=True,
-                    )
+                    bs = len(seq_lens)
 
                     if num_new_pages > 0:
                         block_ids = self.kvcached_allocator.alloc(num_new_pages)
@@ -408,14 +641,25 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
                     out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-                    alloc_decode_kernel[(bs,)](
-                        seq_lens,
-                        last_loc,
-                        free_pages,
-                        out_indices,
-                        next_power_of_2(bs),
-                        self.page_size,
-                    )
+                    if legacy_paged_api:
+                        alloc_decode_kernel[(bs,)](
+                            seq_lens,
+                            last_loc,
+                            free_pages,
+                            out_indices,
+                            self.legacy_ret_values,
+                            next_power_of_2(bs),
+                            self.page_size,
+                        )
+                    else:
+                        alloc_decode_kernel[(bs,)](
+                            seq_lens,
+                            last_loc,
+                            free_pages,
+                            out_indices,
+                            next_power_of_2(bs),
+                            self.page_size,
+                        )
                     return out_indices
 
                 def free(self, free_index):
@@ -619,27 +863,10 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    # Resolve TP rank and size for IPC socket registration.
-                    # SGLang workers each call _create_buffers() independently,
-                    # so we query the distributed state at this point (which is
-                    # guaranteed to be initialised by the time buffers are created).
-                    try:
-                        from sglang.srt.distributed import (
-                            get_pipeline_model_parallel_rank,
-                            get_tensor_model_parallel_rank,
-                            get_tensor_model_parallel_world_size,
-                        )
-                        tp_rank = int(get_tensor_model_parallel_rank())
-                        tp_size = int(get_tensor_model_parallel_world_size())
-                        pp_rank = int(get_pipeline_model_parallel_rank())
-                    except (ImportError, AttributeError):
-                        try:
-                            import torch.distributed as dist
-                            tp_rank = dist.get_rank() if dist.is_initialized() else 0
-                            tp_size = dist.get_world_size() if dist.is_initialized() else 1
-                            pp_rank = 0
-                        except (ImportError, AttributeError, RuntimeError, ValueError, TypeError):
-                            tp_rank, tp_size, pp_rank = 0, 1, 0
+                    # Resolve the TP width within this PP stage.  The global
+                    # distributed world also includes other pipeline stages and
+                    # must never be used as kvcached's local IPC world.
+                    tp_rank, tp_size, pp_rank = _get_sglang_parallel_coordinates()
 
                     # Initialize kvcached with overlap scheduling to be conservative
                     kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank, async_sched=True)
@@ -787,25 +1014,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     import kvcached.integration.sglang.interfaces as kvi
 
                     # Initialize kvcached and create virtual memory buffers.
-                    # Resolve TP rank and size so IPC sockets are registered correctly
-                    # across all TP workers in this SGLang instance.
-                    try:
-                        from sglang.srt.distributed import (
-                            get_pipeline_model_parallel_rank,
-                            get_tensor_model_parallel_rank,
-                            get_tensor_model_parallel_world_size,
-                        )
-                        tp_rank = int(get_tensor_model_parallel_rank())
-                        tp_size = int(get_tensor_model_parallel_world_size())
-                        pp_rank = int(get_pipeline_model_parallel_rank())
-                    except Exception:
-                        try:
-                            import torch.distributed as dist
-                            tp_rank = dist.get_rank() if dist.is_initialized() else 0
-                            tp_size = dist.get_world_size() if dist.is_initialized() else 1
-                            pp_rank = 0
-                        except Exception:
-                            tp_rank, tp_size, pp_rank = 0, 1, 0
+                    tp_rank, tp_size, pp_rank = _get_sglang_parallel_coordinates()
 
                     kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank, async_sched=True)
 
@@ -1053,23 +1262,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     # Resolve TP/PP rank the same way ElasticMHATokenToKVPool
                     # does so the IPC socket naming matches.
-                    try:
-                        from sglang.srt.distributed import (
-                            get_pipeline_model_parallel_rank,
-                            get_tensor_model_parallel_rank,
-                            get_tensor_model_parallel_world_size,
-                        )
-                        tp_rank = int(get_tensor_model_parallel_rank())
-                        tp_size = int(get_tensor_model_parallel_world_size())
-                        pp_rank = int(get_pipeline_model_parallel_rank())
-                    except (ImportError, AttributeError):
-                        try:
-                            import torch.distributed as dist
-                            tp_rank = dist.get_rank() if dist.is_initialized() else 0
-                            tp_size = dist.get_world_size() if dist.is_initialized() else 1
-                            pp_rank = 0
-                        except (ImportError, AttributeError, RuntimeError, ValueError, TypeError):
-                            tp_rank, tp_size, pp_rank = 0, 1, 0
+                    tp_rank, tp_size, pp_rank = _get_sglang_parallel_coordinates()
 
                     kvi.init_kvcached(
                         tp_rank=tp_rank, world_size=tp_size,

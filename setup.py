@@ -90,6 +90,15 @@ def get_extensions():
         )
     else:
         # CUDA driver APIs require libcuda for cuMem* symbols.
+        # NVIDIA's Jetson container runtime may leave a zero-byte libcuda.so
+        # placeholder in /usr/lib/aarch64-linux-gnu while mounting the real
+        # Tegra driver under the nvidia subdirectory.  Put the real driver
+        # directory first so the extension records a DT_NEEDED entry for
+        # libcuda.so.1 instead of retaining unresolved cuMem* symbols.
+        jetson_driver_dir = "/usr/lib/aarch64-linux-gnu/nvidia"
+        jetson_driver_lib = os.path.join(jetson_driver_dir, "libcuda.so")
+        if os.path.isfile(jetson_driver_lib) and os.path.getsize(jetson_driver_lib) > 0:
+            ext_library_dirs.insert(0, jetson_driver_dir)
         ext_libraries = ["cuda"]
         vmm_ops_module = CUDAExtension(
             "kvcached.vmm_ops",

@@ -34,9 +34,19 @@ static inline generic_ptr_t alloc_virtual_mem(const c10::Device &dev,
   // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
   // because PyTorch's ROCm build masquerades HIP devices as CUDA.
   if (dev.is_cuda()) {
+#if defined(__aarch64__)
+    // Tegra's CUDA VMM supports driver-selected virtual addresses, but rejects
+    // the high, x86-oriented kStartAddr hint with CUDA_ERROR_OUT_OF_MEMORY.
+    // The absolute address is not part of kvcached's cross-process protocol:
+    // workers exchange page-relative offsets, so letting the driver select a
+    // valid local UVA range preserves the mapping semantics.
+    CHECK_GPU(gpu_vmm::address_reserve(reinterpret_cast<void **>(&vaddr), size,
+                                       alignment_2mb, nullptr));
+#else
     CHECK_GPU(gpu_vmm::address_reserve(
         reinterpret_cast<void **>(&vaddr), size, alignment_2mb,
         reinterpret_cast<void *>(kStartAddr + offset)));
+#endif
   } else {
     vaddr = mmap(reinterpret_cast<void *>(kStartAddr + offset), size,
                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

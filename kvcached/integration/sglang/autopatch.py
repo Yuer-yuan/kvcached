@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import types
+from collections import defaultdict
 
 from wrapt.importer import when_imported
 
@@ -28,35 +28,47 @@ def _env_enabled() -> bool:
     return os.getenv("KVCACHED_AUTOPATCH", "false").lower() in ("true", "1")
 
 
-@when_imported("sglang")
-def _patch_sglang(_sglang: types.ModuleType) -> None:
-    if not _env_enabled():
-        logger.debug("Disabled by KVCACHED_AUTOPATCH")
-        return
+def _register_target_module_hooks() -> None:
+    """Patch each SGLang module after it is initialized, before consumers run.
 
-    # Create patch manager and register version-specific SGLang patches
-    patch_manager = PatchManager("sglang")
+    Hooking the top-level ``sglang`` package is too early for SGLang 0.4.x:
+    its ``__init__`` eagerly imports the serving stack, so importing allocator
+    targets from that callback encounters partially initialized attention
+    modules.  Target-module hooks preserve the required class-capture order
+    without importing any SGLang module prematurely.
+    """
+    patch_entries = [
+        (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
+        # SWATokenToKVPoolAllocator captures allocator classes from its
+        # implementation modules, not from the package aliases above.
+        (ElasticSWAAllocatorPatch(), ">=0.5.13"),
+        (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
+        (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
+        (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
+        (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
+        # Importing ModelRunner captures memory-pool classes in module globals,
+        # so the memory_pool hook above must run before model_runner finishes.
+        (SGLangVirtualKVCapacityPatch(), SGLANG_ALL_RANGE),
+        (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
+        (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
+    ]
 
-    patch_manager.register_patches_with_versions(
-        [
-            (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
-            # SWATokenToKVPoolAllocator captures allocator classes from its
-            # implementation modules, not from the package aliases above.
-            (ElasticSWAAllocatorPatch(), ">=0.5.13"),
-            (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
-            (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
-            (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
-            (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
-            # Importing ModelRunner captures memory-pool classes in module
-            # globals, so apply this only after every pool alias is installed.
-            (SGLangVirtualKVCapacityPatch(), ">=0.5.11"),
-            (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
-            (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
-        ]
-    )
+    entries_by_module = defaultdict(list)
+    for patch, version_range in patch_entries:
+        entries_by_module[patch.target_module].append((patch, version_range))
 
-    # Apply all patches
-    results = patch_manager.apply_all_patches()
+    for target_module, entries in entries_by_module.items():
 
-    # Log results
-    log_patch_results("sglang", results)
+        @when_imported(target_module)
+        def _patch_target(_module, entries=tuple(entries)) -> None:
+            if not _env_enabled():
+                logger.debug("Disabled by KVCACHED_AUTOPATCH")
+                return
+
+            patch_manager = PatchManager("sglang")
+            patch_manager.register_patches_with_versions(list(entries))
+            results = patch_manager.apply_all_patches()
+            log_patch_results("sglang", results)
+
+
+_register_target_module_hooks()
