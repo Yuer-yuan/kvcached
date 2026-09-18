@@ -117,8 +117,21 @@ class KVCacheManager:
                 f"Mamba) whose per-block state is large. Re-launch with "
                 f"KVCACHED_PAGE_SIZE_MB={min_page_mb} (or larger; must be a "
                 f"multiple of 2).")
-        # NOTE: this is the memory size of the K or V tensor in one layer
-        self.mem_size = self.num_blocks * self.block_mem_size
+        # PageAllocator manages whole VMM pages.  Keep the scheduler-visible
+        # block count exact, but round the backing virtual geometry up to one
+        # complete page.  Without this separation a deliberately small KV
+        # quota (for example 512 tokens on an UMA device) can produce
+        # ``mem_size < PAGE_SIZE``.  PageAllocator then has zero virtual pages
+        # even when the device has ample physical memory, so the mandatory
+        # null block waits forever with ``no_effective_capacity``.
+        #
+        # The final page is trimmed back to ``num_blocks`` by
+        # _initialize_page(), so rounding the backing range does not enlarge
+        # the logical KV quota exposed to the serving engine.
+        logical_mem_size = self.num_blocks * self.block_mem_size
+        self.mem_size = (
+            (logical_mem_size + self.page_size - 1) // self.page_size
+        ) * self.page_size
         self.world_size = world_size
         self.pp_rank = pp_rank
         self.page_allocator = PageAllocator(
@@ -347,6 +360,35 @@ class KVCacheManager:
                     f"alloc_attempts={alloc_attempts}")
             return
 
+    def _logical_page_capacity(self, page_id: int) -> int:
+        """Return how many configured blocks belong to ``page_id``.
+
+        The backing VMM range is page-aligned, while ``num_blocks`` is the
+        exact user-visible quota.  In particular, the last (or only) page can
+        contain fewer logical blocks than its physical capacity.
+        """
+        start, end = InternalPage.get_block_range(
+            page_id, self.page_size, self.block_mem_size
+        )
+        return max(0, min(end, self.num_blocks) - min(start, self.num_blocks))
+
+    def _initialize_page(self, page: InternalPage) -> None:
+        """Initialize a physical page without exposing alignment padding."""
+        page.init(self.block_mem_size)
+        free_blocks = page.get_free_blocks()
+        valid_blocks = [idx for idx in free_blocks if idx < self.num_blocks]
+        if len(valid_blocks) == len(free_blocks):
+            return
+
+        # InternalPage does not expose a mutable free list.  Empty it through
+        # its public API, then return only the logical block ids.  This keeps
+        # recycled pages from ever handing SGLang an id in page-alignment
+        # padding after allocation/free churn.
+        if free_blocks:
+            page.alloc(len(free_blocks))
+        if valid_blocks:
+            page.free_batch(valid_blocks)
+
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
@@ -396,7 +438,7 @@ class KVCacheManager:
                 # restore) and must stay fail-loud.
                 try:
                     page = self.page_allocator.alloc_page()
-                    page.init(self.block_mem_size)
+                    self._initialize_page(page)
                 except RuntimeError as e:
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     logger.warning(
@@ -681,7 +723,19 @@ class KVCacheManager:
             free_pages = min(virtual_free_pages, physical_free_pages)
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
-        return avail_blocks + blocks_from_free_pages
+        physically_available = avail_blocks + blocks_from_free_pages
+
+        # Page alignment must never turn into extra scheduler-visible KV
+        # capacity.  Reserved blocks are physically allocated but remain
+        # available to callers, hence they are added back to the logical free
+        # count after _get_num_alloced_blocks().
+        logical_available = max(
+            0,
+            self.num_blocks
+            - self._get_num_alloced_blocks()
+            + len(self.reserved_blocks),
+        )
+        return min(physically_available, logical_available)
 
     @synchronized
     def get_page_occupancy(self, page_ids: List[int]) -> Dict[int, int]:
@@ -703,9 +757,9 @@ class KVCacheManager:
             # Blocks straddling a page boundary belong to neither page, so a
             # page's capacity comes from its own block range rather than from
             # page_size // block_mem_size.
-            start, end = InternalPage.get_block_range(page_id, self.page_size,
-                                                      self.block_mem_size)
-            occupancy[page_id] = (end - start) - page.num_free_blocks()
+            occupancy[page_id] = (
+                self._logical_page_capacity(page_id) - page.num_free_blocks()
+            )
         return occupancy
 
     @synchronized
@@ -805,13 +859,15 @@ class KVCacheManager:
         try_to_reserve() obtains them via alloc(), so they have already left
         their pages. They are deliberately NOT added a second time below.
         """
-        # Blocks from fully allocated pages
-        blocks_from_full_pages = len(self.full_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size)
-        # Blocks from partially allocated pages. num_avail_blocks is the number
-        # of free blocks in the partially allocated pages so the number of
-        # allocated blocks is the total number of blocks in the partially
-        # allocated pages minus the number of free blocks.
-        blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size) - self.num_avail_blocks
+        # Use each page's logical capacity rather than its page-aligned
+        # physical capacity.  The two differ for a small pool and for the last
+        # page of any non-page-aligned pool.
+        blocks_from_full_pages = sum(
+            self._logical_page_capacity(page_id)
+            for page_id in self.full_pages
+        )
+        blocks_from_avail_pages = sum(
+            self._logical_page_capacity(page_id) - page.num_free_blocks()
+            for page_id, page in self.avail_pages.items()
+        )
         return blocks_from_full_pages + blocks_from_avail_pages
