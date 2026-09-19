@@ -1429,10 +1429,10 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                             t[select_index] = 0
                     return select_index
 
-                def free(self, free_index: Any) -> None:
+                def free(self, free_index: Any):
                     if free_index.numel() == 0:
                         return
-                    self.kvcached_allocator.free(free_index.tolist())
+                    return self.kvcached_allocator.free(free_index.tolist())
 
                 def clear(self) -> None:
                     self.kvcached_allocator.clear()

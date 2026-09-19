@@ -211,6 +211,22 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
 bool FTensorAllocator::unmap_from_kv_tensors(
     const std::vector<offset_t> &offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
+  return unmap_from_kv_tensors_unlocked(offsets);
+}
+
+bool FTensorAllocator::unmap_from_kv_tensors_for_release(
+    const std::vector<offset_t> &offsets, bool &synchronized) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  synchronized = false;
+  if (dev_.is_cuda()) {
+    CHECK_GPU(gpu_vmm::device_synchronize());
+    synchronized = true;
+  }
+  return unmap_from_kv_tensors_unlocked(offsets);
+}
+
+bool FTensorAllocator::unmap_from_kv_tensors_unlocked(
+    const std::vector<offset_t> &offsets) {
   if (num_layers_ == 0) {
     LOGGER(ERROR,
            "try to unmap from KV tensors when KV tensors are not created");

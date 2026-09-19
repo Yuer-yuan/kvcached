@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 
@@ -246,33 +247,19 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
   return std::make_shared<InternalPage>(page_id, page_size_);
 }
 
-void PageAllocator::free_page(page_id_t page_id) {
-  {
-    std::lock_guard<std::mutex> lock(lock_);
-    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
-
-    if (reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
-      // Fast path: reserve page
-      reserved_page_list_.push_back(page_id);
-      update_memory_usage_unlocked();
-      cond_.notify_all();
-      return;
-    }
-  }
-
-  // Slow path: free page and unmap (lock released, exception-safe)
-  unmap_pages({page_id});
-
-  {
-    std::lock_guard<std::mutex> lock(lock_);
-    free_page_list_.push_back(page_id);
-    update_memory_usage_unlocked();
-    cond_.notify_all();
-  }
+PageReleaseReport PageAllocator::free_page(page_id_t page_id) {
+  return free_pages({page_id});
 }
 
-void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
+PageReleaseReport
+PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
   auto start_time = std::chrono::steady_clock::now();
+
+  PageReleaseReport report{
+      static_cast<int64_t>(page_ids.size()), 0, 0, 0, false};
+  if (page_ids.empty()) {
+    return report;
+  }
 
   std::vector<page_id_t> pages_to_unmap;
 
@@ -290,12 +277,15 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       reserved_page_list_.insert(reserved_page_list_.end(), page_ids.begin(),
                                  reserve_end);
 
+      report.retained_pages =
+          static_cast<int64_t>(std::distance(page_ids.begin(), reserve_end));
+
       pages_to_unmap.assign(reserve_end, page_ids.end());
 
       if (pages_to_unmap.empty()) {
         update_memory_usage_unlocked();
         cond_.notify_all();
-        return;
+        return report;
       }
     } else {
       pages_to_unmap = page_ids;
@@ -303,7 +293,10 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
   }
 
   // Slow path: unmap pages (lock released, exception-safe)
-  unmap_pages(pages_to_unmap);
+  report.synchronized = unmap_pages(pages_to_unmap);
+  report.unmapped_pages = static_cast<int64_t>(pages_to_unmap.size());
+  report.released_physical_bytes =
+      report.unmapped_pages * page_size_ * num_layers_ * num_kv_buffers_;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
@@ -318,6 +311,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       end_time - start_time);
   LOGGER(DEBUG, "free %ld pages cost %lu us", page_ids.size(),
          duration.count());
+  return report;
 }
 
 bool PageAllocator::resize(int64_t new_mem_size) {
@@ -697,7 +691,7 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
   LOGGER(INFO, "Mapped %zu pages to KV tensors", page_ids.size());
 }
 
-void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
+bool PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<offset_t> offsets;
@@ -713,18 +707,16 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
+  bool synchronized = false;
   if ((world_size_ > 1 || should_use_worker_ipc()) &&
       broadcast_unmap_callback_) {
     // Multi-process mode: execute unmap on all TP workers via broadcast
     // callback
     broadcast_unmap_callback_(world_size_, offsets);
   } else {
-    // Need to synchronize first in async scheduling mode
-    if (async_sched_) {
-      CHECK_GPU(gpu_vmm::device_synchronize());
-    }
     auto allocator = FTensorAllocator::global_allocator(group_id_);
-    bool success = allocator->unmap_from_kv_tensors(offsets);
+    bool success = allocator->unmap_from_kv_tensors_for_release(
+        offsets, synchronized);
     if (!success) {
       throw std::runtime_error("Failed to unmap pages from KV tensors");
     }
@@ -735,6 +727,7 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
       end_time - start_time);
   LOGGER(INFO, "Unmapped %zu pages from KV tensors, cost: %lu us",
          page_ids.size(), duration.count());
+  return synchronized;
 }
 
 void PageAllocator::update_memory_usage_unlocked() {

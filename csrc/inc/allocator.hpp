@@ -34,6 +34,11 @@ public:
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+  // Synchronize and unmap while holding the same allocator lock.  The output
+  // flag is true only when the local CUDA context supplied synchronization
+  // evidence for an ownership-releasing unmap.
+  bool unmap_from_kv_tensors_for_release(
+      const std::vector<offset_t> &offsets, bool &synchronized);
 
   // Global status interfaces.
   // init() creates the default allocator (group_id=0).
@@ -46,6 +51,8 @@ public:
   void destroy();
 
 private:
+  bool unmap_from_kv_tensors_unlocked(
+      const std::vector<offset_t> &offsets);
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
   std::vector<at::Tensor>

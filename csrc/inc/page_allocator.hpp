@@ -35,6 +35,14 @@ struct PageState {
   int64_t reserved_pages;
 };
 
+struct PageReleaseReport {
+  int64_t logical_pages;
+  int64_t retained_pages;
+  int64_t unmapped_pages;
+  int64_t released_physical_bytes;
+  bool synchronized;
+};
+
 // Independent InternalPage class
 class InternalPage {
 public:
@@ -72,8 +80,8 @@ public:
 
   // Page allocation and deallocation
   std::shared_ptr<InternalPage> alloc_page();
-  void free_page(page_id_t page_id);
-  void free_pages(const std::vector<page_id_t> &page_ids);
+  PageReleaseReport free_page(page_id_t page_id);
+  PageReleaseReport free_pages(const std::vector<page_id_t> &page_ids);
 
   // Memory management
   bool resize(int64_t new_mem_size);
@@ -135,7 +143,7 @@ private:
 
   // Internal methods
   void map_pages(const std::vector<page_id_t> &page_ids);
-  void unmap_pages(const std::vector<page_id_t> &page_ids);
+  bool unmap_pages(const std::vector<page_id_t> &page_ids);
   int64_t get_num_inuse_pages_unlocked() const;
   PageState get_page_state_unlocked() const;
   void update_memory_usage_unlocked();

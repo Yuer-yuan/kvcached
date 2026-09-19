@@ -11,6 +11,7 @@ This module implements a hierarchical memory management system for KV cache:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import functools
 import threading
 import time
@@ -39,6 +40,90 @@ except ImportError as e:
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
+
+
+@dataclass(frozen=True)
+class ReleaseReport:
+    logical_blocks: int
+    emptied_pages: int
+    retained_pages: int
+    unmapped_pages: int
+    released_physical_bytes: int
+    backing_left_slot_ownership: bool
+    mechanism: str
+
+    @classmethod
+    def empty(cls) -> "ReleaseReport":
+        return cls(0, 0, 0, 0, 0, False, "no-op")
+
+    @classmethod
+    def from_native(
+        cls,
+        *,
+        logical_blocks: int,
+        emptied_pages: int,
+        native: object | None,
+    ) -> "ReleaseReport":
+        if emptied_pages == 0:
+            return cls(
+                logical_blocks,
+                0,
+                0,
+                0,
+                0,
+                False,
+                "fragmented-kv-page",
+            )
+        if native is None:
+            return cls(
+                logical_blocks,
+                emptied_pages,
+                emptied_pages,
+                0,
+                0,
+                False,
+                "unreported-page-release",
+            )
+        native_logical_pages = int(getattr(native, "logical_pages"))
+        retained_pages = int(getattr(native, "retained_pages"))
+        unmapped_pages = int(getattr(native, "unmapped_pages"))
+        released_physical_bytes = int(
+            getattr(native, "released_physical_bytes")
+        )
+        synchronized = bool(getattr(native, "synchronized"))
+        if min(
+            native_logical_pages,
+            retained_pages,
+            unmapped_pages,
+            released_physical_bytes,
+        ) < 0:
+            raise RuntimeError("native KV release report contains negative values")
+        if native_logical_pages != emptied_pages:
+            raise RuntimeError("native KV release report has inconsistent logical pages")
+        if retained_pages + unmapped_pages != emptied_pages:
+            raise RuntimeError("native KV release report has inconsistent page totals")
+        ownership_proof = (
+            synchronized
+            and unmapped_pages > 0
+            and released_physical_bytes > 0
+        )
+        if ownership_proof:
+            mechanism = "cuda-vmm-unmap-release"
+        elif unmapped_pages:
+            mechanism = "vmm-release-unverified"
+        elif retained_pages:
+            mechanism = "kvcached-reserved-page"
+        else:
+            mechanism = "no-op"
+        return cls(
+            logical_blocks,
+            emptied_pages,
+            retained_pages,
+            unmapped_pages,
+            released_physical_bytes,
+            ownership_proof,
+            mechanism,
+        )
 
 
 def synchronized(method):
@@ -521,11 +606,11 @@ class KVCacheManager:
         return self.avail_pages.pop(chosen)
 
     @synchronized
-    def free(self, indices: List[int]):
+    def free(self, indices: List[int]) -> ReleaseReport:
         self._wait_post_init()
 
         if len(indices) == 0:
-            return  # Nothing to free
+            return ReleaseReport.empty()
 
         if SANITY_CHECK:
             for idx in indices:
@@ -536,6 +621,7 @@ class KVCacheManager:
         idx_dict = self.page_allocator.group_indices_by_page(indices, self.block_mem_size)
 
         pages_to_free: List[int] = []
+        released_logical_blocks = 0
         for page_id, idxs in idx_dict.items():
             # Find the page - it must be in either full_pages or avail_pages
             page = None
@@ -556,6 +642,7 @@ class KVCacheManager:
                     )
                     continue
 
+            released_logical_blocks += len(idxs)
             self.num_avail_blocks += len(idxs)
             page.free_batch(idxs)
 
@@ -565,8 +652,9 @@ class KVCacheManager:
             else:
                 self.avail_pages[page_id] = page
 
+        native_report = None
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            native_report = self.page_allocator.free_pages(pages_to_free)
 
         if self.in_shrink:
             assert self.target_num_blocks is not None
@@ -575,6 +663,12 @@ class KVCacheManager:
                                            self.block_mem_size)
                 self.in_shrink = False
                 self.target_num_blocks = None
+
+        return ReleaseReport.from_native(
+            logical_blocks=released_logical_blocks,
+            emptied_pages=len(pages_to_free),
+            native=native_report,
+        )
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:

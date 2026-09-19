@@ -89,14 +89,16 @@ page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator) {
   return allocator->alloc_page();
 }
 
-void page_allocator_free_page(std::shared_ptr<PageAllocator> allocator,
-                              page_id_t page_id) {
-  allocator->free_page(page_id);
+PageReleaseReport
+page_allocator_free_page(std::shared_ptr<PageAllocator> allocator,
+                         page_id_t page_id) {
+  return allocator->free_page(page_id);
 }
 
-void page_allocator_free_pages(std::shared_ptr<PageAllocator> allocator,
-                               const std::vector<page_id_t> &page_ids) {
-  allocator->free_pages(page_ids);
+PageReleaseReport
+page_allocator_free_pages(std::shared_ptr<PageAllocator> allocator,
+                          const std::vector<page_id_t> &page_ids) {
+  return allocator->free_pages(page_ids);
 }
 
 bool page_allocator_resize(std::shared_ptr<PageAllocator> allocator,
@@ -212,6 +214,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
 
   // PageAllocator bindings
+  py::class_<kvcached::PageReleaseReport>(m, "PageReleaseReport")
+      .def_readonly("logical_pages",
+                    &kvcached::PageReleaseReport::logical_pages)
+      .def_readonly("retained_pages",
+                    &kvcached::PageReleaseReport::retained_pages)
+      .def_readonly("unmapped_pages",
+                    &kvcached::PageReleaseReport::unmapped_pages)
+      .def_readonly("released_physical_bytes",
+                    &kvcached::PageReleaseReport::released_physical_bytes)
+      .def_readonly("synchronized",
+                    &kvcached::PageReleaseReport::synchronized);
+
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(
       m, "PageAllocator")
       .def(py::init(&kvcached::create_page_allocator), py::arg("num_layers"),
